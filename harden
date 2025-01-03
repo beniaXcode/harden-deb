@@ -1,0 +1,303 @@
+#!/bin/bash
+
+# Ensure script is run as root
+if [ "$EUID" -ne 0 ]; then 
+    echo "Please run as root"
+    exit
+fi
+
+log_file="/var/log/hardening.log"
+exec 1> >(tee -a "$log_file") 2>&1
+
+echo "Starting CIS hardening at $(date)"
+
+# Install required packages
+apt update && apt install -y \
+    aide \
+    auditd \
+    audispd-plugins \
+    apparmor \
+    apparmor-utils \
+    chrony \
+    fail2ban \
+    libpam-pwquality \
+    openssh-server \
+    rsyslog \
+    sudo \
+    tcpd \
+    ufw \
+    unattended-upgrades
+
+# 1.1 Filesystem Configuration
+# 1.1.1 Disable unused filesystems
+disabled_filesystems=(
+    "cramfs"
+    "freevxfs"
+    "jffs2"
+    "hfs"
+    "hfsplus"
+    "squashfs"
+    "udf"
+    "vfat"
+)
+
+for fs in "${disabled_filesystems[@]}"; do
+    echo "install $fs /bin/false" > "/etc/modprobe.d/$fs.conf"
+    echo "blacklist $fs" >> "/etc/modprobe.d/$fs.conf"
+done
+
+# 1.1.2-7 Configure filesystem options
+cat >> /etc/fstab << EOF
+tmpfs /tmp tmpfs defaults,rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /var/tmp tmpfs defaults,rw,nosuid,nodev,noexec,relatime 0 0
+tmpfs /dev/shm tmpfs defaults,nodev,nosuid,noexec 0 0
+EOF
+
+# 1.2 Configure Software Updates
+cat > /etc/apt/apt.conf.d/50unattended-upgrades << EOF
+Unattended-Upgrade::Allowed-Origins {
+    "\${distro_id}:\${distro_codename}";
+    "\${distro_id}:\${distro_codename}-security";
+};
+Unattended-Upgrade::Package-Blacklist {};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::InstallOnShutdown "false";
+Unattended-Upgrade::Mail "root";
+Unattended-Upgrade::MailReport "on-change";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+
+# 2.1 Time Synchronization
+cat > /etc/chrony/chrony.conf << EOF
+server pool.ntp.org iburst
+stratumweight 0
+driftfile /var/lib/chrony/drift
+rtcsync
+makestep 10 3
+bindcmdaddress 127.0.0.1
+bindcmdaddress ::1
+keyfile /etc/chrony/chrony.keys
+commandkey 1
+generatecommandkey
+noclientlog
+logchange 0.5
+logdir /var/log/chrony
+EOF
+
+systemctl enable chronyd
+systemctl start chronyd
+
+# 3.1 Network Parameters
+cat > /etc/sysctl.d/99-security.conf << EOF
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv6.conf.all.accept_ra = 0
+net.ipv6.conf.default.accept_ra = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv6.conf.all.disable_ipv6 = 1
+kernel.randomize_va_space = 2
+fs.suid_dumpable = 0
+EOF
+
+sysctl -p /etc/sysctl.d/99-security.conf
+
+# 4.1 Configure UFW
+ufw reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw logging on
+ufw allow ssh
+ufw enable
+
+# 5.1 Configure SSH
+cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+cat > /etc/ssh/sshd_config << EOF
+Protocol 2
+LogLevel VERBOSE
+X11Forwarding no
+MaxAuthTries 4
+IgnoreRhosts yes
+HostbasedAuthentication no
+PermitRootLogin no
+PermitEmptyPasswords no
+PermitUserEnvironment no
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr,aes192-ctr,aes128-ctr
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,hmac-sha2-512,hmac-sha2-256
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group14-sha256,diffie-hellman-group16-sha512,diffie-hellman-group18-sha512,ecdh-sha2-nistp521,ecdh-sha2-nistp384,ecdh-sha2-nistp256
+ClientAliveInterval 300
+ClientAliveCountMax 0
+LoginGraceTime 60
+Banner /etc/issue.net
+UsePAM yes
+EOF
+
+systemctl restart sshd
+
+# 5.2 Configure PAM and Password Policies
+sed -i 's/^password\s*requisite\s*pam_pwquality.so.*/password requisite pam_pwquality.so retry=3/' /etc/pam.d/common-password
+
+cat > /etc/security/pwquality.conf << EOF
+minlen = 14
+dcredit = -1
+ucredit = -1
+ocredit = -1
+lcredit = -1
+minclass = 4
+maxrepeat = 3
+EOF
+
+sed -i 's/PASS_MAX_DAYS.*/PASS_MAX_DAYS 90/' /etc/login.defs
+sed -i 's/PASS_MIN_DAYS.*/PASS_MIN_DAYS 7/' /etc/login.defs
+sed -i 's/PASS_WARN_AGE.*/PASS_WARN_AGE 7/' /etc/login.defs
+
+# 5.3 Configure sudo
+echo "Defaults use_pty
+Defaults logfile=/var/log/sudo.log
+Defaults passwd_timeout=1
+Defaults timestamp_timeout=15" > /etc/sudoers.d/custom
+
+# 6.1 Configure System Accounting with auditd
+cp /etc/audit/auditd.conf /etc/audit/auditd.conf.bak
+cat > /etc/audit/auditd.conf << EOF
+log_file = /var/log/audit/audit.log
+log_format = RAW
+log_group = root
+priority_boost = 4
+flush = INCREMENTAL_ASYNC
+freq = 50
+num_logs = 5
+disp_qos = lossy
+dispatcher = /sbin/audispd
+name_format = NONE
+max_log_file = 8
+max_log_file_action = ROTATE
+space_left = 75
+space_left_action = EMAIL
+action_mail_acct = root
+admin_space_left = 50
+admin_space_left_action = SUSPEND
+disk_full_action = SUSPEND
+disk_error_action = SUSPEND
+EOF
+
+# 6.2 Configure System Auditing
+cat > /etc/audit/rules.d/99-finalize.rules << EOF
+-w /etc/passwd -p wa -k identity
+-w /etc/group -p wa -k identity
+-w /etc/shadow -p wa -k identity
+-w /etc/gshadow -p wa -k identity
+-w /etc/security/opasswd -p wa -k identity
+-w /var/log/faillog -p wa -k logins
+-w /var/log/lastlog -p wa -k logins
+-w /var/run/utmp -p wa -k session
+-w /var/log/wtmp -p wa -k logins
+-w /var/log/btmp -p wa -k logins
+-w /etc/selinux/ -p wa -k MAC-policy
+-w /etc/sudoers -p wa -k scope
+-w /var/log/sudo.log -p wa -k actions
+EOF
+
+# 7.1 Configure AIDE
+aideinit
+mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+
+echo "0 5 * * * root /usr/sbin/aide --check" > /etc/cron.d/aide
+
+# 7.2 Enable AppArmor
+aa-enforce /etc/apparmor.d/*
+
+# 8.1 Configure rsyslog
+echo "*.* @@log_host:514" >> /etc/rsyslog.conf
+systemctl restart rsyslog
+
+# 8.2 Configure logrotate
+cat > /etc/logrotate.d/rsyslog << EOF
+/var/log/syslog
+/var/log/mail.info
+/var/log/mail.warn
+/var/log/mail.err
+/var/log/mail.log
+/var/log/daemon.log
+/var/log/kern.log
+/var/log/auth.log
+/var/log/user.log
+/var/log/lpr.log
+/var/log/cron.log
+/var/log/debug
+/var/log/messages
+{
+    rotate 7
+    daily
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate
+    endscript
+}
+EOF
+
+# 9.1 Configure cron
+chmod 0600 /etc/crontab
+chmod 0600 /etc/cron.hourly
+chmod 0600 /etc/cron.daily
+chmod 0600 /etc/cron.weekly
+chmod 0600 /etc/cron.monthly
+chmod 0600 /etc/cron.d
+
+echo "ALL: ALL" >> /etc/hosts.deny
+echo "sshd: ALL" >> /etc/hosts.allow
+
+# 10.1 Remove unused services and packages
+apt purge -y \
+    xinetd \
+    nis \
+    tftp-server \
+    talk-server \
+    telnet-server \
+    rsh-server \
+    rsync
+
+# 10.2 Configure fail2ban
+cat > /etc/fail2ban/jail.local << EOF
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = 5
+
+[sshd]
+enabled = true
+EOF
+
+systemctl enable fail2ban
+systemctl restart fail2ban
+
+# Final steps
+echo "Generating AIDE database..."
+aide --init
+mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+
+echo "CIS hardening complete at $(date). Please review /var/log/hardening.log and reboot the system."
+
+# Generate before/after security report
+if [ -x "$(command -v lynis)" ]; then
+    lynis audit system > /root/security_audit_after.txt
+fi
